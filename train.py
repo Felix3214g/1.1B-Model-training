@@ -111,7 +111,8 @@ class StreamingChatDataset(IterableDataset):
     def __init__(self, dataset, tokenizer, block_size):
         self.dataset = dataset
         self.tokenizer = tokenizer
-        self.block = block_size
+        # store block size explicitly to avoid confusion
+        self.block_size = block_size
 
     def __iter__(self):
         for ex in self.dataset:
@@ -119,14 +120,14 @@ class StreamingChatDataset(IterableDataset):
             if not formatted:
                 continue
             tokens = self.tokenizer(formatted)["input_ids"]
-            for i in range(0, len(tokens), self.block):
-                chunk = tokens[i : i + self.block]
-                if len(chunk) < self.block:
+            for i in range(0, len(tokens), self.block_size):
+                chunk = tokens[i : i + self.block_size]
+                if len(chunk) < self.block_size:
                     continue
                 yield {
                     "input_ids": chunk,
                     "labels": chunk.copy(),
-                    "attention_mask": [1] * self.block,
+                    "attention_mask": [1] * self.block_size,
                 }
 
 def get_or_build_tokenizer(out_dir: Path):

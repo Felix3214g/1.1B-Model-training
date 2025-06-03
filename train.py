@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+
 import argparse
 import os
 import sys
@@ -52,6 +52,10 @@ MODEL_CONFIG = {
     "n_positions": 2048,
     "n_ctx": 2048,
 }
+
+def count_trainable_parameters(model: 'torch.nn.Module') -> int:
+    """Count the number of trainable parameters in a model."""
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 def parse_args():
     p = argparse.ArgumentParser(description="Train / Resume / Infer Chat‑GPT‑like model")
@@ -111,42 +115,42 @@ class StreamingChatDataset(IterableDataset):
     def __init__(self, dataset, tokenizer, block_size):
         self.dataset = dataset
         self.tokenizer = tokenizer
-        # store block size explicitly to avoid confusion
         self.block_size = block_size
 
     def __iter__(self):
         for ex in self.dataset:
             formatted = format_conversation(ex)["text"]
-            if not formatted:
+            if not formatted.strip():  # Check for empty or whitespace-only strings
                 continue
-            tokens = self.tokenizer(formatted)["input_ids"]
+            tokens = self.tokenizer(formatted, truncation=True, max_length=self.block_size)["input_ids"]
+            # Only yield chunks that are exactly block_size
             for i in range(0, len(tokens), self.block_size):
                 chunk = tokens[i : i + self.block_size]
-                if len(chunk) < self.block_size:
-                    continue
-                yield {
-                    "input_ids": chunk,
-                    "labels": chunk.copy(),
-                    "attention_mask": [1] * self.block_size,
-                }
+                if len(chunk) == self.block_size:  # Only use full chunks
+                    yield {
+                        "input_ids": chunk,
+                        "labels": chunk.copy(),
+                        "attention_mask": [1] * self.block_size,
+                    }
 
 def get_or_build_tokenizer(out_dir: Path):
-    if (out_dir / "tokenizer").exists():
-        tok = AutoTokenizer.from_pretrained(out_dir / "tokenizer")
+    tokenizer_path = out_dir / "tokenizer"
+    if tokenizer_path.exists():
+        tok = AutoTokenizer.from_pretrained(tokenizer_path)
     else:
         tok = AutoTokenizer.from_pretrained("gpt2", use_fast=True)
-        tok.add_special_tokens(
-            {
-                "pad_token": SPECIAL_TOKENS["pad"],
-                "bos_token": SPECIAL_TOKENS["end"],
-                "eos_token": SPECIAL_TOKENS["end"],
-                "additional_special_tokens": [
-                    SPECIAL_TOKENS["user"],
-                    SPECIAL_TOKENS["assistant"],
-                ],
-            }
-        )
-        tok.save_pretrained(out_dir / "tokenizer")
+        # Add special tokens
+        special_tokens_dict = {
+            "pad_token": SPECIAL_TOKENS["pad"],
+            "bos_token": SPECIAL_TOKENS["end"],
+            "eos_token": SPECIAL_TOKENS["end"],
+            "additional_special_tokens": [
+                SPECIAL_TOKENS["user"],
+                SPECIAL_TOKENS["assistant"],
+            ],
+        }
+        tok.add_special_tokens(special_tokens_dict)
+        tok.save_pretrained(tokenizer_path)
     return tok
 
 def build_model(tokenizer, context_len):
@@ -163,42 +167,47 @@ def build_model(tokenizer, context_len):
     )
     config = GPT2Config(**cfg_dict)
     model = GPT2LMHeadModel(config)
+    # Resize embeddings to match tokenizer vocabulary
     model.resize_token_embeddings(len(tokenizer))
     return model
+
+def load_and_prepare_datasets(dataset_names, streaming, logger):
+    """Load and prepare datasets with better error handling."""
+    raw_sets = []
+    for name in dataset_names:
+        ds = None
+        try:
+            ds = load_dataset(name, split="train", streaming=streaming, trust_remote_code=True)
+            raw_sets.append(ds)
+            logger.info(f"Successfully loaded dataset: {name}")
+        except Exception as e:
+            logger.error(f"Failed to load dataset '{name}': {e}")
+            continue
+    
+    if not raw_sets:
+        raise RuntimeError("No datasets could be loaded. Please check dataset names or try --streaming.")
+    
+    return raw_sets
 
 def main():
     args = parse_args()
     out_dir = Path(args.output_dir).expanduser()
     out_dir.mkdir(parents=True, exist_ok=True)
+    
     logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
     logger = logging.getLogger("chatbot_train")
+    
     set_seed(args.seed)
     accelerator = Accelerator(gradient_accumulation_steps=args.gradient_accumulation_steps)
     device = accelerator.device
+    
     tokenizer = get_or_build_tokenizer(out_dir)
     block_size = min(args.context_length, tokenizer.model_max_length)
+    
     if args.mode in {"train", "resume"}:
-        logger.info("Lade Datensätze …")
-        raw_sets = []
-        for name in args.dataset_names:
-            ds = None
-            for stream_flag in ([args.streaming] + ([True] if not args.streaming else [])):
-                try:
-                    ds = load_dataset(name, split="train", streaming=stream_flag, trust_remote_code=True)
-                    if stream_flag and not args.streaming:
-                        logger.warning("'%s' wurde erfolgreich im Streaming‑Modus geladen.", name)
-                    break
-                except datasets.exceptions.DataFilesNotFoundError:
-                    logger.warning("Keine Daten für '%s' mit streaming=%s gefunden.", name, stream_flag)
-                except Exception as e:
-                    logger.error("Fehler beim Laden von '%s' (streaming=%s): %s", name, stream_flag, e)
-                    break
-            if ds is None:
-                logger.error("Überspringe Datensatz '%s' – konnte nicht geladen werden.", name)
-                continue
-            raw_sets.append(ds)
-        if not raw_sets:
-            raise RuntimeError("Kein Datensatz konnte geladen werden. Bitte Dataset‑Namen prüfen oder --streaming aktivieren.")
+        logger.info("Loading datasets...")
+        raw_sets = load_and_prepare_datasets(args.dataset_names, args.streaming, logger)
+        
         if args.streaming:
             combined = datasets.interleave_datasets(raw_sets)
             train_data = StreamingChatDataset(combined, tokenizer, block_size)
@@ -206,38 +215,56 @@ def main():
         else:
             train_sets = []
             for ds in raw_sets:
-                f_ds = ds.map(format_conversation, remove_columns=ds.column_names, desc="format")
-                f_ds = f_ds.filter(lambda x: bool(x["text"]))
-                try:
-                    if len(f_ds) == 0:
-                        logger.warning("Datensatz '%s' enthält nach Formatierung keine gültigen Beispiele – überspringe.", ds.builder_name if hasattr(ds, 'builder_name') else 'unknown')
-                        continue
-                except TypeError:
-                    pass
-                train_sets.append(f_ds)
+                # Format conversations
+                formatted_ds = ds.map(
+                    format_conversation, 
+                    remove_columns=ds.column_names, 
+                    desc="Formatting conversations"
+                )
+                # Filter out empty examples
+                filtered_ds = formatted_ds.filter(lambda x: bool(x["text"].strip()))
+                
+                if len(filtered_ds) > 0:
+                    train_sets.append(filtered_ds)
+                else:
+                    logger.warning(f"Dataset contains no valid examples after formatting")
+            
             if not train_sets:
-                raise RuntimeError("Nach Formatierung/Filterung sind keine Trainingsbeispiele übrig geblieben. Prüfe Datensätze oder aktiviere --streaming.")
+                raise RuntimeError("No valid training examples found after formatting/filtering")
+            
+            # Combine and shuffle datasets
             merged: Dataset = datasets.concatenate_datasets(train_sets).shuffle(seed=args.seed)
-            def tokenize(batch):
-                ids = tokenizer(batch["text"], truncation=True, max_length=block_size)
-                batch["input_ids"] = ids["input_ids"]
-                batch["attention_mask"] = ids["attention_mask"]
-                batch["labels"] = ids["input_ids"]
-                return batch
-            train_data = merged.map(tokenize, batched=True, remove_columns=["text"], num_proc=os.cpu_count())
+            
+            def tokenize_function(batch):
+                # Tokenize with proper truncation
+                tokenized = tokenizer(
+                    batch["text"], 
+                    truncation=True, 
+                    max_length=block_size,
+                    padding=False
+                )
+                # Set labels same as input_ids for language modeling
+                tokenized["labels"] = tokenized["input_ids"].copy()
+                return tokenized
+            
+            train_data = merged.map(
+                tokenize_function, 
+                batched=True, 
+                remove_columns=["text"], 
+                num_proc=min(4, os.cpu_count() or 1),
+                desc="Tokenizing"
+            )
             eval_data = None
-            if not train_data:
-                raise ValueError("Trainingsdatensatz ist nach der Verarbeitung leer. Überprüfe Filter oder Formatierung.")
-            required_cols = {"input_ids", "attention_mask", "labels"}
-            if not required_cols.issubset(train_data.column_names):
-                raise ValueError(f"Erwartete Spalten {required_cols} nicht im Trainingsdatensatz gefunden. Vorhanden: {train_data.column_names}")
+        
+        # Build model
         model = build_model(tokenizer, block_size)
         n_params = count_trainable_parameters(model)
-        logger.info("Trainable parameters: %.1f M", n_params / 1e6)
-        print(f"{n_params/1e6:.1f} M trainable parameters")
+        logger.info(f"Model has {n_params/1e6:.1f}M trainable parameters")
+        
+        # Training arguments
         training_args = TrainingArguments(
             output_dir=str(out_dir),
-            overwrite_output_dir=args.mode == "train",
+            overwrite_output_dir=(args.mode == "train"),
             per_device_train_batch_size=args.per_device_train_batch_size,
             per_device_eval_batch_size=args.per_device_train_batch_size,
             gradient_accumulation_steps=args.gradient_accumulation_steps,
@@ -250,8 +277,14 @@ def main():
             fp16=torch.cuda.is_available(),
             gradient_checkpointing=True,
             report_to="none",
+            save_total_limit=3,  # Keep only last 3 checkpoints
+            dataloader_drop_last=True,  # Important for consistent batch sizes
         )
+        
+        # Data collator
         data_collator = DataCollatorForLanguageModeling(tokenizer, mlm=False)
+        
+        # Trainer
         trainer = Trainer(
             model=model,
             args=training_args,
@@ -260,53 +293,95 @@ def main():
             tokenizer=tokenizer,
             data_collator=data_collator,
         )
-        logger.info("Starte Training …")
+        
+        logger.info("Starting training...")
         try:
-            trainer.train(resume_from_checkpoint=args.mode == "resume")
+            if args.mode == "resume":
+                trainer.train(resume_from_checkpoint=True)
+            else:
+                trainer.train()
         except RuntimeError as e:
             if "out of memory" in str(e).lower():
-                logger.error("OOM aufgetreten – reduziere Kontextlänge auf 1024 und versuche erneut …")
-                trainer.args.per_device_train_batch_size = 1
-                trainer.args.gradient_accumulation_steps *= 2
-                trainer.model.config.n_ctx = 1024
-                trainer.model.config.n_positions = 1024
-                trainer.train()
+                logger.error("Out of memory error occurred. Try reducing batch size or context length.")
+                raise
             else:
                 raise
-        logger.info("Training beendet. Speichere finalen Checkpoint …")
+        
+        logger.info("Training completed. Saving final model...")
         trainer.save_model(out_dir / "final_model")
         tokenizer.save_pretrained(out_dir / "final_model")
+        
     elif args.mode == "inference":
         model_path = Path(args.inference_model_path or out_dir / "final_model")
+        
+        if not model_path.exists():
+            raise FileNotFoundError(f"Model not found at {model_path}")
+        
         tokenizer = AutoTokenizer.from_pretrained(model_path)
-        model = GPT2LMHeadModel.from_pretrained(model_path, torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32).to(device)
+        model = GPT2LMHeadModel.from_pretrained(
+            model_path, 
+            torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32
+        ).to(device)
         model.eval()
-        stop_ids = [tokenizer.convert_tokens_to_ids(tok) for tok in SPECIAL_TOKENS.values() if tok in tokenizer.vocab]
-        print("Chatbot bereit – tippe 'quit' zum Beenden.")
+        
+        # Get stop token IDs
+        stop_ids = []
+        for token in SPECIAL_TOKENS.values():
+            if token in tokenizer.get_vocab():
+                stop_ids.append(tokenizer.convert_tokens_to_ids(token))
+        
+        print("Chatbot ready - type 'quit' to exit.")
         history = ""
+        
         while True:
-            prompt = input(f"{SPECIAL_TOKENS['user']} ")
-            if prompt.lower() in {"quit", "exit"}:
+            try:
+                prompt = input(f"{SPECIAL_TOKENS['user']} ")
+                if prompt.lower().strip() in {"quit", "exit"}:
+                    break
+                
+                # Build conversation history
+                current_input = f"{SPECIAL_TOKENS['user']} {prompt}\n{SPECIAL_TOKENS['assistant']}"
+                full_input = history + current_input
+                
+                # Tokenize input
+                inputs = tokenizer(full_input, return_tensors="pt", truncation=True, max_length=block_size-args.max_new_tokens)
+                inputs = inputs.to(device)
+                
+                # Generate response
+                with torch.no_grad():
+                    outputs = model.generate(
+                        **inputs,
+                        max_new_tokens=args.max_new_tokens,
+                        temperature=0.7,
+                        top_p=0.9,
+                        do_sample=True,
+                        eos_token_id=tokenizer.eos_token_id,
+                        pad_token_id=tokenizer.pad_token_id,
+                    )
+                
+                # Decode response
+                response = tokenizer.decode(
+                    outputs[0][inputs.input_ids.shape[-1]:], 
+                    skip_special_tokens=True
+                ).strip()
+                
+                print(f"{SPECIAL_TOKENS['assistant']} {response}\n")
+                
+                # Update history (keep it manageable)
+                history += current_input + " " + response + f"\n{SPECIAL_TOKENS['end']}\n"
+                # Trim history if it gets too long
+                if len(history) > block_size // 2:
+                    history = history[-block_size//4:]  # Keep last quarter
+                    
+            except KeyboardInterrupt:
+                print("\nExiting...")
                 break
-            history += f"{SPECIAL_TOKENS['user']} {prompt}\n{SPECIAL_TOKENS['assistant']}"
-            inputs = tokenizer(history, return_tensors="pt").to(device)
-            with torch.no_grad():
-                outputs = model.generate(
-                    **inputs,
-                    max_new_tokens=args.max_new_tokens,
-                    temperature=0.7,
-                    top_p=0.9,
-                    eos_token_id=stop_ids,
-                    pad_token_id=tokenizer.pad_token_id,
-                )
-            answer = tokenizer.decode(outputs[0][inputs.input_ids.shape[-1]:], skip_special_tokens=True)
-            print(f"{SPECIAL_TOKENS['assistant']} {answer}\n")
-            history += " " + answer + f"\n{SPECIAL_TOKENS['end']}\n"
+            except Exception as e:
+                logger.error(f"Error during inference: {e}")
+                continue
+    
     else:
-        raise ValueError("Unbekannter Modus")
-
-def count_trainable_parameters(model: 'torch.nn.Module') -> int:
-    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+        raise ValueError(f"Unknown mode: {args.mode}")
 
 if __name__ == "__main__":
     main()
